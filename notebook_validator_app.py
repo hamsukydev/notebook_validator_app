@@ -1,594 +1,533 @@
 import streamlit as st
 import json
 import re
-from io import StringIO
-import tempfile
 import os
+import tempfile
+from collections import Counter
+from typing import List, Tuple, Dict, Any
+import traceback
 
-# Regex patterns
-TAG = re.compile(r"^\*\*\[([^\]]+)\]\*\*$")
-META_LINE = re.compile(r'^\s*[-*]?\s*(.*?)\s*[:\-](.*)$')
+# Configuration Constants
+MIN_TURN_METADATA = 8
+MIN_FAIL_PERCENTAGE = 50
+MIN_HUMAN_PASS_PERCENTAGE = 100
+RESTRICTED_INSTRUCTIONS = [
+    "length_constraints:number_characters",
+    "length_constraints:number_words",
+    "length_constraints:sentence_length",
+    "length_constraints:word_length",
+    "length_constraints:avg_word_length",
+    "length_constraints:paragraph_length",
+    "change_case:lowercase_word_frequency",
+    "change_case:capital_word_frequency",
+    "change_case:vowel_consonant_balance",
+    "keywords:letter_frequency",
+    "keywords:vowel_count",
+    "keywords:consonant_count",
+    "keywords:alliteration",
+    "keywords:palindrome_word",
+    "keywords:positioning",
+    "punctuation:question_exclaim",
+    "detectable_format:max_paragraph_length",
+    "detectable_content:numeric_inclusion"
+]
+CHECK_MISALIGNED_VALIDATION = True
 
-def preview(lines, n=60):
-    """Returns a short snippet of the first non-empty line"""
-    for l in lines:
-        if l.strip():
-            clean = l.strip().replace('*', '').replace('`', '')
-            return (clean[:n] + "...") if len(clean) > n else clean
-    return "<empty cell>"
+# Utility Functions
+def word_count(text: str) -> int:
+    """Count words in text"""
+    return len(text.split())
 
-def format_error(cell_num, tag, error_type, specific_msg, content_snippet):
-    """Helper to create a consistent, easy-to-read error block"""
-    tag_display = f" {tag} " if tag else " <No Tag> "
+def format_error(index: int, tag: str, error_type: str, details: str, preview: str = "") -> str:
+    """Format error message"""
+    return f"🔴 Cell {index} [{tag}] - {error_type}: {details}\n   Preview: {preview[:100]}..."
+
+def evaluate_results(results: List[Dict]) -> Dict:
+    """Evaluate validation results"""
+    status_counts = Counter(item["status"] for item in results)
+    llm_status_counts = Counter(item["status"] for item in results if "llm_judge_" in item["id"])
+    
+    total = len(results)
+    passed = status_counts.get("Passed", 0)
+    failed = status_counts.get("Failed", 0)
+    
+    pass_percentage = (passed / total) * 100 if total else 0
+    fail_percentage = (failed / total) * 100 if total else 0
+    
     return {
-        "cell": cell_num,
-        "tag": tag_display,
-        "type": error_type,
-        "message": specific_msg,
-        "snippet": content_snippet
+        "total_length": total,
+        "passed": passed,
+        "failed": failed,
+        "pass_percentage": round(pass_percentage, 2),
+        "fail_percentage": round(fail_percentage, 2),
+        "llm_passed": llm_status_counts.get("Passed", 0),
+        "llm_failed": llm_status_counts.get("Failed", 0),
     }
 
-def word_count(s):
-    return len(re.findall(r"\b\w+\b", s))
-
-def parse_range(text):
-    if not text: return None
-    text_clean = text.lower().replace(",", "")
-
-    # Handle "Above", "Over", "Greater than"
-    if any(x in text_clean for x in ["above", "over", ">", "min"]):
-        nums = [int(x) for x in re.findall(r"\d+", text_clean)]
-        if nums:
-            return nums[0], 999999
-
-    # Handle "Up to", "Below", "Under"
-    if any(x in text_clean for x in ["up to", "below", "under", "<", "max"]):
-        nums = [int(x) for x in re.findall(r"\d+", text_clean)]
-        if nums:
-            return 0, nums[0]
-
-    # Handle explicit ranges "X-Y", "X to Y"
-    match = re.search(r'(\d+)\s*(?:-|–|to)\s*(\d+)', text_clean)
-    if match:
-        return int(match.group(1)), int(match.group(2))
-
-    # Fallback: single number means exact match
-    nums = [int(x) for x in re.findall(r"\d+", text_clean)]
-    if not nums: return None
-    if len(nums) == 1: return nums[0], nums[0]
-    return nums[0], nums[1]
-
-def get_metadata(nb):
-    cells = nb.get("cells", [])
-    if not cells: return {}
-    src = "".join(cells[0].get("source", []))
-    meta = {}
-    for raw in src.splitlines():
-        m = META_LINE.match(raw)
-        if not m: continue
-        key = m.group(1).replace('*', '').strip().rstrip(":").lower()
-        val = m.group(2).strip().lstrip('*-').strip()
-        if key:
-            meta[key] = val
-    return meta
-
-def get_tags(nb):
-    meta = get_metadata(nb)
-    tags, errors, previews, bodies, indices = [], [], [], [], []
-
-    cells = nb.get("cells", [])
-
-    for i, c in enumerate(cells):
-        if i == 0: continue  # Skip metadata cell
-
-        src = "".join(c.get("source", []))
-        lines = [l.rstrip("\n\r") for l in src.splitlines()]
-
-        current_preview = preview(lines) if lines else "<empty>"
-
-        if not lines:
-            continue
-
-        first = lines[0].strip()
-        m = TAG.match(first)
-
-        if not m:
-            if any(l.strip() for l in lines):
-                errors.append(format_error(
-                    i, None, "Format Error",
-                    "Found a cell without a **[tag]** header.",
-                    current_preview
-                ))
-            continue
-
-        # Check for blank line after tag
-        if len(lines) < 3 or lines[1].strip() != "" or not lines[2].strip():
-            errors.append(format_error(
-                i, first, "Format Error",
-                "The tag must be followed by exactly one blank line before content.",
-                current_preview
-            ))
-            continue
-
-        tag_label = "[" + m.group(1) + "]"
-        tags.append(tag_label)
-
-        body_lines = lines[2:]
-        bodies.append("\n".join(body_lines))
-        previews.append(preview(body_lines) if body_lines else "<empty content>")
-        indices.append(i)
-
-    return tags, errors, previews, bodies, indices, meta
-
-def validate_structure(tags, previews, indices):
-    errs = []
-
-    def get_ctx(idx_in_list):
-        if 0 <= idx_in_list < len(tags):
-            return indices[idx_in_list], tags[idx_in_list], previews[idx_in_list]
-        return "?", "End of File", "N/A"
-
-    if not tags:
-        errs.append({"type": "Structure Error", "message": "No tagged cells found in this notebook.", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-        return errs
-
-    # Find the last [assistant] tag
-    try:
-        last_a_rev_index = tags[::-1].index("[assistant]")
-        last_a = len(tags) - 1 - last_a_rev_index
-    except ValueError:
-        errs.append({"type": "Structure Error", "message": "Could not find any [assistant] tag. The conversation must contain at least one assistant response.", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-        return errs
-
-    if last_a == 0:
-        c, t, p = get_ctx(0)
-        errs.append(format_error(c, t, "Structure Error", "The final [assistant] tag cannot be the very first cell.", p))
-
-    # Check [turn_metadata] location
-    if last_a - 2 < 0 or tags[last_a - 2] != "[turn_metadata]":
-        c, t, p = get_ctx(last_a - 2)
-        errs.append(format_error(
-            c, t, "Structure Error",
-            "The tag [turn_metadata] is missing or misplaced. It must appear two positions before the final [assistant] (before [thinking]).",
-            p
-        ))
-
-    # Check [thinking] appears before final [assistant]
-    if last_a - 1 < 0 or tags[last_a - 1] != "[thinking]":
-        c, t, p = get_ctx(last_a - 1)
-        errs.append(format_error(
-            c, t, "Structure Error",
-            "The tag [thinking] is missing or misplaced. It must appear immediately before the final [assistant] cell.",
-            p
-        ))
-
-    # Check everything before the split point
-    conv_end = last_a - 2
-    
-    for j in range(conv_end):
-        t = tags[j]
-        if t not in ("[system]", "[user]", "[thinking]", "[assistant]"):
-            c, _, p = get_ctx(j)
-            errs.append(format_error(
-                c, t, "Structure Error",
-                "Invalid tag found in the main conversation area. Only [system], [user], [thinking], or [assistant] are allowed here.",
-                p
-            ))
-    
-    # Validate conversation turn structure
-    i = 0
-    while i < conv_end:
-        if tags[i] == "[user]":
-            if i + 1 == conv_end:
-                pass
-            else:
-                if i + 1 >= len(tags) or tags[i + 1] != "[thinking]":
-                    c, t, p = get_ctx(i + 1) if i + 1 < len(tags) else get_ctx(i)
-                    errs.append(format_error(
-                        c, t if i + 1 < len(tags) else tags[i], "Structure Error",
-                        f"Expected [thinking] after [user], but found {tags[i + 1] if i + 1 < len(tags) else 'end of file'}.",
-                        p
-                    ))
-                elif i + 2 >= len(tags) or tags[i + 2] != "[assistant]":
-                    c, t, p = get_ctx(i + 2) if i + 2 < len(tags) else get_ctx(i + 1)
-                    errs.append(format_error(
-                        c, t if i + 2 < len(tags) else tags[i + 1], "Structure Error",
-                        f"Expected [assistant] after [thinking], but found {tags[i + 2] if i + 2 < len(tags) else 'end of file'}.",
-                        p
-                    ))
-        i += 1
-
-    # SINGLE FAMILY ENFORCEMENT
-    model_tags = tags[last_a + 1:]
-    
-    if not model_tags:
-        c, t, p = get_ctx(last_a)
-        errs.append(format_error(
-            c, t, "Structure Error",
-            "No model comparison blocks found after the final assistant response.",
-            p
-        ))
-        return errs
-
-    families_found = set()
-    for t in model_tags:
-        m = re.search(r"assistant_(nemo|qwen)_", t)
-        if m:
-            families_found.add(m.group(1))
-    
-    if len(families_found) == 0:
-         errs.append({"type": "Structure Error", "message": "No valid 'nemo' or 'qwen' tags found in the model block section.", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-         return errs
-    
-    if len(families_found) > 1:
-        fam_list = ", ".join(families_found)
-        c, t, p = get_ctx(last_a + 1)
-        errs.append(format_error(
-            c, t, "Structure Error",
-            f"Mixed model families detected ({fam_list}). Please use ONLY 'nemo' blocks OR ONLY 'qwen' blocks in a single notebook.",
-            p
-        ))
-        return errs
-    
-    target_family = list(families_found)[0]
-    expected_index = 1
-
-    i = last_a + 1
-    n = len(tags)
-
-    while i < n:
-        if i + 3 >= n:
-            c, t, p = get_ctx(i)
-            errs.append(format_error(
-                c, t, "Structure Error",
-                "Incomplete model block definition. A block must contain 4 cells: [thinking] -> [assistant_X_#] -> [validation] -> [human_report].",
-                p
-            ))
-            break
-
-        t_think, t_resp, t_val, t_human = tags[i], tags[i+1], tags[i+2], tags[i+3]
-        c_think, _, p_think = get_ctx(i)
-
-        if t_think != "[thinking]":
-            errs.append(format_error(
-                c_think, t_think, "Structure Error",
-                f"Expected [thinking] at the start of model block #{expected_index}, but found {t_think}.",
-                p_think
-            ))
-            i += 1
-            continue
-
-        m = re.fullmatch(fr"\[assistant_{target_family}_(\d+)\]", t_resp)
-        v = re.fullmatch(fr"\[assistant_{target_family}_(\d+)_validation_report\]", t_val)
-        h = re.fullmatch(fr"\[assistant_{target_family}_(\d+)_human_report\]", t_human)
-
-        if not (m and v and h):
-            c_resp, _, p_resp = get_ctx(i+1)
-            errs.append(format_error(
-                c_resp, t_resp, "Structure Error",
-                f"Invalid tag sequence. Expected [thinking] -> [assistant_{target_family}_#] -> validation -> human_report.\n"
-                f"       Found: {t_think}, {t_resp}, {t_val}, {t_human}.\n"
-                f"       (Note: Ensure you are not mixing 'nemo' and 'qwen' families).",
-                p_resp
-            ))
-        else:
-            idxs = {int(m.group(1)), int(v.group(1)), int(h.group(1))}
-
-            if len(idxs) != 1:
-                c_resp, _, p_resp = get_ctx(i+1)
-                errs.append(format_error(
-                    c_resp, t_resp, "Structure Error",
-                    f"ID Mismatch. Tags have different numbers: {t_resp}, {t_val}, {t_human}. They must share the same index.",
-                    p_resp
-                ))
-            else:
-                idx = idxs.pop()
-                if idx != expected_index:
-                    c_resp, _, p_resp = get_ctx(i+1)
-                    errs.append(format_error(
-                        c_resp, t_resp, "Sequence Error",
-                        f"Unexpected index for {target_family}. Expected block #{expected_index}, but found block #{idx}.",
-                        p_resp
-                    ))
-                expected_index += 1
-        i += 4
-
-    return errs
-
-def validate_lengths(tags, bodies, meta):
-    errs = []
-    if not meta:
-        return errs
-
-    def rng(key):
-        v = meta.get(key)
-        if not v: return None, None, None
-        r = parse_range(v)
-        if not r:
-            errs.append({"type": "Metadata Error", "message": f"Could not parse range for '{key}'. Value found: '{v}'", "cell": "Metadata", "tag": "N/A", "snippet": "N/A"})
-            return None, None, v
-        return r[0], r[1], v
-
-    min_c, max_c, c_text = rng("conversation length")
-    min_s, max_s, s_text = rng("system prompt length")
-    min_u, max_u, u_text = rng("user prompt length")
-
-    try:
-        last_a_idx = max(i for i, t in enumerate(tags) if t == "[assistant]")
-    except ValueError:
-        last_a_idx = -1
-
-    conv_end = last_a_idx
-    if last_a_idx > 1 and tags[last_a_idx - 1] == "[thinking]" and tags[last_a_idx - 2] == "[turn_metadata]":
-        conv_end = last_a_idx - 2
-
-    if conv_end >= 0:
-        if min_c is not None:
-            conv_tags = tags[:conv_end]
-            turns = sum(1 for t in conv_tags if t == "[user]")
-            if not (min_c <= turns <= max_c):
-                errs.append({"type": "Length Error", "message": f"Conversation turns ({turns}) outside range ({c_text}).", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-
-        if min_s is not None:
-            sys_words = sum(word_count(bodies[i]) for i, t in enumerate(tags[:conv_end]) if t == "[system]")
-            if sys_words > 0:
-                if not (min_s <= sys_words <= max_s):
-                     errs.append({"type": "Length Error", "message": f"System prompt words ({sys_words}) outside range ({s_text}).", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-
-        if min_u is not None:
-            user_counts = [word_count(bodies[i]) for i, t in enumerate(tags[:conv_end]) if t == "[user]"]
-            if user_counts:
-                avg = int(round(sum(user_counts) / len(user_counts)))
-                if not (min_u <= avg <= max_u):
-                    errs.append({"type": "Length Error", "message": f"Avg user prompt words ({avg}) outside range ({u_text}).", "cell": "N/A", "tag": "N/A", "snippet": "N/A"})
-
-    return errs
-
-def extract_json_from_body(body):
+def extract_json_from_body(body: str) -> Tuple[str, str]:
+    """Extract JSON from markdown code block"""
     lines = body.splitlines()
     i = 0
     while i < len(lines) and not lines[i].strip():
         i += 1
     if i == len(lines):
         return None, "Cell is empty. Expected a ```json block."
-
+    
     first = lines[i].strip()
     if not re.fullmatch(r"```+\s*json\s*", first, re.I):
         return None, "Content must start explicitly with ```json"
-
+    
     j = i + 1
     while j < len(lines) and not lines[j].strip().startswith("```"):
         j += 1
-
+    
     if j == len(lines):
         return None, "Missing closing ``` for the JSON block."
-
+    
     return "\n".join(lines[i+1:j]), None
 
-def validate_json_cells(tags, bodies, previews, indices):
+def get_tags(filepath: str) -> Tuple[List, List, List, List, List, Dict]:
+    """Extract tags and metadata from notebook"""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        nb = json.load(f)
+    
+    tags = []
+    bodies = []
+    previews = []
+    indices = []
+    cell_errors = []
+    meta = {}
+    
+    # Extract metadata
+    if "metadata" in nb and "length_constraints" in nb["metadata"]:
+        meta = nb["metadata"]["length_constraints"]
+    
+    cells = nb.get("cells", [])
+    
+    for idx, cell in enumerate(cells):
+        cell_tags = cell.get("metadata", {}).get("tags", [])
+        source = "".join(cell.get("source", []))
+        
+        if not cell_tags:
+            continue
+        
+        tag = cell_tags[0]
+        tags.append(tag)
+        bodies.append(source)
+        indices.append(idx)
+        
+        # Create preview
+        first_line = source.split("\n")[0] if source else ""
+        previews.append(first_line[:50])
+    
+    return tags, cell_errors, previews, bodies, indices, meta
+
+def validate_structure(tags: List[str], previews: List[str], indices: List[int]) -> List[str]:
+    """Validate notebook structure"""
     errs = []
+    
+    # Check for required tags
+    if "[system]" not in tags:
+        errs.append("❌ Missing required [system] tag")
+    if "[turn_metadata]" not in tags:
+        errs.append("❌ Missing required [turn_metadata] tag")
+    
+    # Find conversation end
+    try:
+        conv_end = tags.index("[conversation_end]")
+    except ValueError:
+        errs.append("❌ Missing [conversation_end] tag")
+        return errs
+    
+    # Validate conversation structure
+    conv_tags = tags[:conv_end]
+    
+    # Check alternating pattern
+    user_assistant_tags = [t for t in conv_tags if t in ["[user]", "[assistant_nemo]", "[assistant_qwen]"]]
+    
+    if not user_assistant_tags:
+        errs.append("❌ No conversation turns found")
+        return errs
+    
+    for i in range(len(user_assistant_tags) - 1):
+        if user_assistant_tags[i] == "[user]" and user_assistant_tags[i+1] == "[user]":
+            errs.append(f"❌ Consecutive [user] tags found - pattern broken")
+        elif user_assistant_tags[i] in ["[assistant_nemo]", "[assistant_qwen]"] and \
+             user_assistant_tags[i+1] in ["[assistant_nemo]", "[assistant_qwen]"]:
+            errs.append(f"❌ Consecutive assistant tags found - pattern broken")
+    
+    return errs
+
+def validate_lengths(tags: List[str], bodies: List[str], meta: Dict) -> List[str]:
+    """Validate length constraints"""
+    errs = []
+    
+    # Parse metadata
+    c_text = meta.get("conversation_turns", "")
+    s_text = meta.get("system_prompt_words", "")
+    u_text = meta.get("user_prompt_words", "")
+    
+    # Parse ranges
+    def parse_range(text):
+        if not text:
+            return None, None
+        m = re.match(r"(\d+)\s*-\s*(\d+)", text)
+        if m:
+            return int(m.group(1)), int(m.group(2))
+        return None, None
+    
+    min_c, max_c = parse_range(c_text)
+    min_s, max_s = parse_range(s_text)
+    min_u, max_u = parse_range(u_text)
+    
+    # Find conversation end
+    try:
+        conv_end = tags.index("[conversation_end]")
+    except ValueError:
+        return errs
+    
+    # Check turn count
+    if min_c is not None:
+        conv_tags = tags[:conv_end]
+        turns = sum(1 for t in conv_tags if t == "[user]")
+        if not (min_c <= turns <= max_c):
+            errs.append(f"📏 Length Error: Conversation turns ({turns}) outside range ({c_text})")
+    
+    # Check system prompt
+    if min_s is not None:
+        sys_words = sum(word_count(bodies[i]) for i, t in enumerate(tags[:conv_end]) if t == "[system]")
+        if sys_words > 0:
+            if not (min_s <= sys_words <= max_s):
+                errs.append(f"📏 Length Error: System prompt words ({sys_words}) outside range ({s_text})")
+    
+    # Check user prompts
+    if min_u is not None:
+        for i, t in enumerate(tags[:conv_end]):
+            if t == "[user]":
+                user_count = word_count(bodies[i])
+                if user_count:
+                    if not (min_u <= user_count <= max_u):
+                        errs.append(f"📏 Length Error: User prompt words ({user_count}) outside range ({u_text})")
+    
+    return errs
+
+def validate_json_cells(tags: List[str], bodies: List[str], previews: List[str], indices: List[int]) -> List[str]:
+    """Validate JSON formatting in cells"""
+    errs = []
+    
     for i, t in enumerate(tags):
         if t == "[turn_metadata]" or \
            re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_validation_report\]", t) or \
            re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_human_report\]", t):
-
+            
             js, err = extract_json_from_body(bodies[i])
             if err:
-                errs.append(format_error(
-                    indices[i], t, "JSON Format Error",
-                    err, previews[i]
-                ))
+                errs.append(format_error(indices[i], t, "JSON Format Error", err, previews[i]))
                 continue
+            
             try:
                 json.loads(js)
             except Exception as e:
-                errs.append(format_error(
-                    indices[i], t, "JSON Syntax Error",
-                    str(e), previews[i]
-                ))
+                errs.append(format_error(indices[i], t, "JSON Syntax Error", str(e), previews[i]))
+    
     return errs
 
-def validate_notebook(nb):
-    """Main validation function that returns results"""
-    tags, cell_errors, previews, bodies, indices, meta = get_tags(nb)
+def validate_report_len_cells(tags: List[str], bodies: List[str], previews: List[str], indices: List[int]) -> List[str]:
+    """Validate report cells and metadata"""
+    errs = []
+    basic_validation = {}
+    llm_results = None
+    hllm_results = None
     
-    structure_errors = validate_structure(tags, previews, indices)
-    length_errors = validate_lengths(tags, bodies, meta)
-    json_errors = validate_json_cells(tags, bodies, previews, indices)
+    for i, t in enumerate(tags):
+        if t == "[turn_metadata]" or \
+           re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_validation_report\]", t) or \
+           re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_human_report\]", t):
+            
+            js, err = extract_json_from_body(bodies[i])
+            if err:
+                errs.append(format_error(indices[i], t, "JSON Format Error", err, previews[i]))
+                continue
+            
+            try:
+                parsed_json = json.loads(js)
+                
+                if t == "[turn_metadata]":
+                    basic_validation[t] = {
+                        "instructions": len(parsed_json.get("instructions", [])),
+                        "llm_judge": len(parsed_json.get("llm_judge", []))
+                    }
+                    basic_validation[t]["total"] = basic_validation[t]["instructions"] + basic_validation[t]["llm_judge"]
+                    
+                    instructionset = parsed_json.get("instructions", [])
+                    if (len(instructionset) + len(parsed_json.get("llm_judge", []))) < MIN_TURN_METADATA:
+                        errs.append(format_error(
+                            indices[i], t, f"Minimum {MIN_TURN_METADATA} turn_metadata",
+                            "length validation", previews[i]
+                        ))
+                    
+                    if instructionset:
+                        word_checks = [instr for instr in instructionset 
+                                     if instr.get("instruction_id") in RESTRICTED_INSTRUCTIONS]
+                        if word_checks:
+                            errs.append(format_error(
+                                indices[i], t, "Restricted Instructions in turn_metadata",
+                                str(word_checks), previews[i]
+                            ))
+                
+                else:
+                    results = parsed_json.get("results") if isinstance(parsed_json, dict) else parsed_json
+                    report = evaluate_results(results)
+                    basic_validation[t] = report
+                    
+                    turn_metadata_report = basic_validation.get("[turn_metadata]")
+                    
+                    if re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_validation_report\]", t):
+                        if report.get("total_length") != turn_metadata_report.get("total"):
+                            errs.append(format_error(
+                                indices[i], t, "Turn_MetaData Validation Report coverage Error",
+                                f"TMD:{turn_metadata_report.get('total')} is not {t}:{report.get('total_length')}", 
+                                str(report)
+                            ))
+                        
+                        try:
+                            passed = [x for x in results if x["status"].lower() == "passed"]
+                            failed = [x for x in results if x["status"].lower() == "failed"]
+                            llm_results = [f"{_.get('id')}_Passed" for _ in passed if "llm_judge_" in _.get("id")] + \
+                                        [f"{_.get('id')}_Failed" for _ in failed if "llm_judge_" in _.get("id")]
+                        except Exception as e:
+                            errs.append(f"🔴 {t} - VALIDATION REPORT ERROR: ID field not found in JSON for llm_judge")
+                            continue
+                    
+                    if re.fullmatch(r"\[assistant_(nemo|qwen)_\d+_human_report\]", t):
+                        passed = [x for x in results if x["status"].lower() == "passed"]
+                        failed = [x for x in results if x["status"].lower() == "failed"]
+                        
+                        try:
+                            hllm_results = [f"{_.get('id')}_Passed" for _ in passed if "llm_judge_" in _.get("id")] + \
+                                         [f"{_.get('id')}_Failed" for _ in failed if "llm_judge_" in _.get("id")]
+                        except Exception as e:
+                            errs.append(f"🔴 {t} - HUMAN REPORT ERROR: ID field not found in JSON for llm_judge")
+                            continue
+                        
+                        report = evaluate_results(results)
+                        basic_validation[t] = report
+                        
+                        if report["total_length"] != basic_validation["[turn_metadata]"]["llm_judge"]:
+                            errs.append(f"🔴 {t} - Turn_MetaData Human Report Coverage Error")
+                    
+                    if llm_results is not None and hllm_results is not None:
+                        llmr = set(sorted(llm_results))
+                        hllmr = set(sorted(hllm_results))
+                        
+                        intersection = llmr & hllmr
+                        human_validation_passed = len(intersection) == len(llm_results)
+                        
+                        if not human_validation_passed:
+                            validation_results = basic_validation[t.replace("human", "validation")]
+                            human_results = basic_validation[t]
+                            
+                            diff_llm_failed = validation_results["failed"] + (human_results["llm_failed"] - validation_results["llm_failed"])
+                            total_failed_percentage = (diff_llm_failed / validation_results["total_length"]) * 100
+                            
+                            if int(total_failed_percentage) < int(MIN_FAIL_PERCENTAGE):
+                                errs.append(f"🔴 {t} - HUMAN VALIDATION ERROR: Total failed percentage ({total_failed_percentage:.2f}%) is less than minimum ({MIN_FAIL_PERCENTAGE}%)")
+            
+            except Exception as e:
+                errs.append(f"🔴 {t} - Error processing: {str(e)}")
     
-    all_errors = cell_errors + structure_errors + length_errors + json_errors
-    
-    return {
-        "valid": len(all_errors) == 0,
-        "errors": all_errors,
-        "metadata": meta,
-        "stats": {
-            "total_cells": len(tags),
-            "format_errors": len(cell_errors),
-            "structure_errors": len(structure_errors),
-            "length_errors": len(length_errors),
-            "json_errors": len(json_errors)
-        }
-    }
+    return errs
 
-# Streamlit UI
+def validate(tags: List[str], previews: List[str], bodies: List[str], indices: List[int], meta: Dict) -> List[str]:
+    """Main validation function"""
+    errs = []
+    errs.extend(validate_structure(tags, previews, indices))
+    errs.extend(validate_lengths(tags, bodies, meta))
+    errs.extend(validate_json_cells(tags, bodies, previews, indices))
+    errs.extend(validate_report_len_cells(tags, bodies, previews, indices))
+    return errs
+
+def validate_notebook(filepath: str) -> Tuple[bool, List[str]]:
+    """Validate a single notebook file"""
+    try:
+        tags, cell_errors, previews, bodies, indices, meta = get_tags(filepath)
+        all_errs = cell_errors + validate(tags, previews, bodies, indices, meta)
+        
+        is_valid = len(all_errs) == 0
+        return is_valid, all_errs
+    except Exception as e:
+        return False, [f"🔥 Unexpected error: {str(e)}\n{traceback.format_exc()}"]
+
+# Streamlit App
 def main():
     st.set_page_config(
-        page_title="Notebook Validator",
+        page_title="Jupyter Notebook Validator",
         page_icon="📓",
         layout="wide"
     )
     
-    st.title("📓 Jupyter Notebook Validator")
-    st.markdown("Upload your `.ipynb` notebooks to validate their structure, formatting, and content.")
+    st.title("📓 Jupyter Notebook Structure Validator")
+    st.markdown("---")
     
-    # Sidebar for information
+    # Sidebar for configuration
     with st.sidebar:
-        st.header("About")
-        st.markdown("""
-        This validator checks:
-        - **Structure**: Proper tag sequencing
-        - **Format**: Tag formatting and spacing
-        - **Length**: Conversation and prompt lengths
-        - **JSON**: Syntax in metadata/reports
-        - **Model Families**: Single family consistency
-        """)
+        st.header("⚙️ Configuration")
+        st.markdown(f"**Min Turn Metadata:** {MIN_TURN_METADATA}")
+        st.markdown(f"**Min Fail Percentage:** {MIN_FAIL_PERCENTAGE}%")
+        st.markdown(f"**Min Human Pass:** {MIN_HUMAN_PASS_PERCENTAGE}%")
         
-        st.header("Valid Tags")
-        st.code("""
-[system]
-[user]
-[thinking]
-[assistant]
-[turn_metadata]
-[assistant_nemo_#]
-[assistant_qwen_#]
-[assistant_X_#_validation_report]
-[assistant_X_#_human_report]
+        st.markdown("---")
+        st.subheader("📋 Validation Checks")
+        st.markdown("""
+        - ✅ Notebook structure
+        - ✅ Required tags
+        - ✅ JSON formatting
+        - ✅ Turn metadata
+        - ✅ Validation reports
+        - ✅ Human reports
+        - ✅ Length constraints
+        - ✅ Restricted instructions
         """)
     
-    # File uploader
+    # Main content
+    st.header("Upload Notebook(s)")
     uploaded_files = st.file_uploader(
-        "Choose notebook file(s)",
-        type=['ipynb'],
+        "Choose .ipynb file(s)",
+        type=["ipynb"],
         accept_multiple_files=True,
-        help="Upload one or more .ipynb files for validation"
+        help="Upload one or more Jupyter notebook files for validation"
     )
     
     if uploaded_files:
         st.markdown("---")
+        st.header("Validation Results")
         
         # Summary metrics
-        total_files = len(uploaded_files)
+        col1, col2, col3 = st.columns(3)
         valid_count = 0
         invalid_count = 0
+        error_count = 0
         
         results = []
         
         # Process each file
         for uploaded_file in uploaded_files:
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".ipynb") as tmp_file:
+                tmp_file.write(uploaded_file.getvalue())
+                tmp_path = tmp_file.name
+            
             try:
-                # Load notebook
-                nb_content = uploaded_file.read()
-                nb = json.loads(nb_content)
+                is_valid, errors = validate_notebook(tmp_path)
                 
-                # Validate
-                result = validate_notebook(nb)
-                result['filename'] = uploaded_file.name
-                results.append(result)
-                
-                if result['valid']:
+                if is_valid:
                     valid_count += 1
+                elif errors and any("Unexpected error" in err for err in errors):
+                    error_count += 1
                 else:
                     invalid_count += 1
-                    
-            except Exception as e:
-                st.error(f"❌ Failed to process {uploaded_file.name}: {str(e)}")
+                
+                results.append({
+                    "filename": uploaded_file.name,
+                    "is_valid": is_valid,
+                    "errors": errors
+                })
+            finally:
+                # Cleanup temp file
+                os.unlink(tmp_path)
         
         # Display summary
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Total Files", total_files)
-        with col2:
-            st.metric("✅ Valid", valid_count)
-        with col3:
-            st.metric("❌ Invalid", invalid_count)
+        col1.metric("✅ Valid", valid_count)
+        col2.metric("❌ Invalid", invalid_count)
+        col3.metric("🔥 Errors", error_count)
         
         st.markdown("---")
         
-        # Display results for each file
+        # Display detailed results
         for result in results:
-            filename = result['filename']
+            filename = result["filename"]
+            is_valid = result["is_valid"]
+            errors = result["errors"]
             
-            if result['valid']:
+            if is_valid:
                 st.success(f"✅ **{filename}** - VALID")
-                
-                # Show metadata if available
-                if result['metadata']:
-                    with st.expander("📋 Metadata", expanded=False):
-                        for key, value in result['metadata'].items():
-                            st.text(f"{key}: {value}")
-                
             else:
-                st.error(f"❌ **{filename}** - INVALID")
+                if errors and any("Unexpected error" in err for err in errors):
+                    st.error(f"🔥 **{filename}** - CRASH")
+                else:
+                    st.error(f"❌ **{filename}** - INVALID")
                 
-                # Show statistics
-                stats = result['stats']
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Format Errors", stats['format_errors'])
-                with col2:
-                    st.metric("Structure Errors", stats['structure_errors'])
-                with col3:
-                    st.metric("Length Errors", stats['length_errors'])
-                with col4:
-                    st.metric("JSON Errors", stats['json_errors'])
-                
-                # Show errors
-                with st.expander("🔍 View Errors", expanded=True):
-                    for idx, error in enumerate(result['errors'], 1):
-                        error_type = error.get('type', 'Error')
-                        cell = error.get('cell', 'N/A')
-                        tag = error.get('tag', 'N/A')
-                        message = error.get('message', '')
-                        snippet = error.get('snippet', '')
-                        
-                        # Color code by error type
-                        if 'Format' in error_type:
-                            color = "🔴"
-                        elif 'Structure' in error_type:
-                            color = "🟠"
-                        elif 'Length' in error_type:
-                            color = "🟡"
-                        elif 'JSON' in error_type:
-                            color = "🔵"
-                        else:
-                            color = "⚪"
-                        
-                        st.markdown(f"""
-                        **{color} Error #{idx}** - Cell {cell} {tag}
-                        - **Type:** {error_type}
-                        - **Message:** {message}
-                        - **Snippet:** `{snippet}`
-                        """)
-                        st.markdown("---")
-                
-                # Show metadata if available
-                if result['metadata']:
-                    with st.expander("📋 Metadata", expanded=False):
-                        for key, value in result['metadata'].items():
-                            st.text(f"{key}: {value}")
+                # Display errors in expander
+                with st.expander(f"View errors for {filename}", expanded=False):
+                    for error in errors:
+                        st.code(error, language=None)
+        
+        # Download results option
+        st.markdown("---")
+        st.subheader("📥 Download Results")
+        
+        # Create results text
+        results_text = "JUPYTER NOTEBOOK VALIDATION RESULTS\n"
+        results_text += "=" * 80 + "\n\n"
+        results_text += f"Total Files: {len(uploaded_files)}\n"
+        results_text += f"Valid: {valid_count}\n"
+        results_text += f"Invalid: {invalid_count}\n"
+        results_text += f"Errors: {error_count}\n\n"
+        results_text += "=" * 80 + "\n\n"
+        
+        for result in results:
+            filename = result["filename"]
+            is_valid = result["is_valid"]
+            errors = result["errors"]
             
-            st.markdown("---")
+            if is_valid:
+                results_text += f"✅ VALID: {filename}\n\n"
+            else:
+                results_text += f"❌ INVALID: {filename}\n"
+                for error in errors:
+                    results_text += f"   {error}\n"
+                results_text += "\n"
+            results_text += "-" * 80 + "\n\n"
+        
+        st.download_button(
+            label="Download Validation Report",
+            data=results_text,
+            file_name="validation_report.txt",
+            mime="text/plain"
+        )
     
     else:
-        st.info("👆 Upload one or more notebook files to begin validation")
+        st.info("👆 Upload one or more .ipynb files to begin validation")
         
-        # Show example
-        with st.expander("📖 Example notebook structure"):
+        # Display example
+        with st.expander("ℹ️ What does this validator check?"):
             st.markdown("""
-            ```
-            Cell 0: Metadata
-            - Conversation length: X-Y
-            - System prompt length: X-Y
-            - User prompt length: X-Y
+            ### Validation Checks:
             
-            Cell 1: **[system]**
+            1. **Structure Validation**
+               - Presence of required tags: `[system]`, `[turn_metadata]`, `[conversation_end]`
+               - Proper alternating pattern of `[user]` and `[assistant_nemo]`/`[assistant_qwen]` tags
             
-            System prompt content...
+            2. **JSON Formatting**
+               - Valid JSON in `[turn_metadata]`, validation reports, and human reports
+               - Proper markdown code block formatting with ` ```json `
             
-            Cell 2: **[user]**
+            3. **Turn Metadata**
+               - Minimum number of turn metadata entries
+               - No restricted instructions
             
-            User message...
+            4. **Validation Reports**
+               - Coverage matches turn metadata
+               - Proper pass/fail percentages
             
-            Cell 3: **[thinking]**
+            5. **Human Reports**
+               - Validation alignment with automated reports
+               - Minimum failure percentage requirements
             
-            Internal reasoning...
-            
-            Cell 4: **[assistant]**
-            
-            Assistant response...
-            ```
+            6. **Length Constraints**
+               - Conversation turn count within specified range
+               - System prompt word count validation
+               - User prompt word count validation
             """)
 
 if __name__ == "__main__":
